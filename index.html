@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ぶーぶー どらいぶ</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #87ceeb;
+    font-family: "Hiragino Maru Gothic ProN", "BIZ UDGothic", "Yu Gothic", sans-serif;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  #game { display: block; width: 100%; height: 100%; }
+  #soundBtn {
+    position: fixed; top: 10px; right: 10px;
+    width: 52px; height: 52px;
+    font-size: 28px; line-height: 1;
+    border: none; border-radius: 50%;
+    background: rgba(255,255,255,0.85);
+    box-shadow: 0 3px 6px rgba(0,0,0,0.2);
+    cursor: pointer; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="soundBtn" aria-label="おと">🔊</button>
+<script>
+"use strict";
+
+/* ---------- 基本セットアップ ---------- */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------- サウンド (Web Audio・外部ファイル不要) ---------- */
+let audioCtx = null;
+let soundOn = true;
+const soundBtn = document.getElementById("soundBtn");
+soundBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  soundOn = !soundOn;
+  soundBtn.textContent = soundOn ? "🔊" : "🔇";
+});
+
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+
+function tone(freq, dur, type, vol, delay) {
+  if (!soundOn || !audioCtx) return;
+  const t0 = audioCtx.currentTime + (delay || 0);
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || "sine";
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(vol || 0.2, t0 + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.05);
+}
+
+const sfx = {
+  collect() { tone(880, 0.12, "sine", 0.25); tone(1320, 0.15, "sine", 0.2, 0.08); },
+  fruit()   { tone(660, 0.1, "triangle", 0.25); tone(990, 0.12, "triangle", 0.2, 0.07); },
+  bump()    { tone(140, 0.25, "square", 0.15); tone(100, 0.3, "square", 0.1, 0.05); },
+  horn()    { tone(440, 0.18, "square", 0.15); tone(440, 0.18, "square", 0.15, 0.25); },
+  start()   { [523, 659, 784].forEach((f, i) => tone(f, 0.15, "sine", 0.25, i * 0.12)); },
+  fanfare() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.22, "triangle", 0.3, i * 0.13)); },
+};
+
+/* ---------- ゲームの状態 ---------- */
+const CAR_COLORS = [
+  { body: "#ff5252", dark: "#c62828" },   // あか
+  { body: "#448aff", dark: "#1565c0" },   // あお
+  { body: "#ffd600", dark: "#f9a825" },   // きいろ
+];
+
+let state = "select";        // "select" | "play"
+let carColor = CAR_COLORS[0];
+let carX = 0;                // 車の中心X
+let carTargetX = 0;
+let carWobble = 0;           // ぶつかった時のゆらゆら
+let speed = 260;             // 道路スクロール速度 px/s
+let roadOffset = 0;
+let stars = 0;
+let items = [];              // {x, y, type}
+let particles = [];          // お祝いの紙ふぶき等
+let sceneryL = [];           // 道の外の木や家
+let sceneryR = [];
+let clouds = [];
+let spawnTimer = 0;
+let celebrateTimer = 0;
+let lastMilestone = 0;
+let lastTime = 0;
+
+const ITEM_TYPES = [
+  { emoji: "⭐", kind: "star",  weight: 5 },
+  { emoji: "🍎", kind: "fruit", weight: 2 },
+  { emoji: "🍌", kind: "fruit", weight: 2 },
+  { emoji: "🍓", kind: "fruit", weight: 2 },
+  { emoji: "🚧", kind: "cone",  weight: 2 },
+];
+
+function roadRect() {
+  const rw = Math.min(W * 0.7, 520);
+  return { x: (W - rw) / 2, w: rw };
+}
+
+function carSize() {
+  const { w } = roadRect();
+  const cw = Math.min(w * 0.26, 110);
+  return { w: cw, h: cw * 1.45 };
+}
+
+function initScenery() {
+  sceneryL = []; sceneryR = []; clouds = [];
+  const emL = ["🌳", "🌷", "🏠", "🌻", "🌳"];
+  const emR = ["🌳", "🏫", "🌼", "🐶", "🌳"];
+  for (let i = 0; i < 6; i++) {
+    sceneryL.push({ y: (H / 6) * i, emoji: emL[i % emL.length] });
+    sceneryR.push({ y: (H / 6) * i + H / 12, emoji: emR[i % emR.length] });
+  }
+  for (let i = 0; i < 4; i++) {
+    clouds.push({ x: Math.random() * W, y: 20 + Math.random() * 80, s: 0.5 + Math.random() });
+  }
+}
+initScenery();
+
+function startGame(colorIdx) {
+  carColor = CAR_COLORS[colorIdx];
+  state = "play";
+  stars = 0;
+  lastMilestone = 0;
+  speed = 260;
+  items = [];
+  particles = [];
+  carX = W / 2;
+  carTargetX = W / 2;
+  spawnTimer = 0.5;
+  sfx.start();
+}
+
+/* ---------- 入力 (タッチ / マウス / キーボード) ---------- */
+const keys = {};
+window.addEventListener("keydown", (e) => {
+  keys[e.key] = true;
+  ensureAudio();
+  if (state === "select" && (e.key === " " || e.key === "Enter")) startGame(0);
+  if (state === "play" && e.key === " ") sfx.horn();
+});
+window.addEventListener("keyup", (e) => { keys[e.key] = false; });
+
+let pointerDown = false;
+function pointerPos(e) {
+  const t = e.touches ? e.touches[0] : e;
+  return { x: t.clientX, y: t.clientY };
+}
+function onDown(e) {
+  ensureAudio();
+  const p = pointerPos(e);
+  if (state === "select") {
+    // 車えらびボタンの当たり判定
+    const btns = selectButtons();
+    for (let i = 0; i < btns.length; i++) {
+      const b = btns[i];
+      if (p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h) {
+        startGame(i);
+        return;
+      }
+    }
+    return;
+  }
+  pointerDown = true;
+  carTargetX = p.x;
+}
+function onMove(e) {
+  if (!pointerDown || state !== "play") return;
+  carTargetX = pointerPos(e).x;
+  e.preventDefault();
+}
+function onUp() { pointerDown = false; }
+
+canvas.addEventListener("mousedown", onDown);
+canvas.addEventListener("mousemove", onMove);
+window.addEventListener("mouseup", onUp);
+canvas.addEventListener("touchstart", onDown, { passive: true });
+canvas.addEventListener("touchmove", onMove, { passive: false });
+window.addEventListener("touchend", onUp);
+
+/* ---------- 車えらび画面のボタン配置 ---------- */
+function selectButtons() {
+  const bw = Math.min(W * 0.26, 170);
+  const bh = bw * 1.15;
+  const gap = Math.min(W * 0.05, 30);
+  const total = bw * 3 + gap * 2;
+  const x0 = (W - total) / 2;
+  const y = H * 0.42;
+  return [0, 1, 2].map((i) => ({ x: x0 + i * (bw + gap), y, w: bw, h: bh }));
+}
+
+/* ---------- 描画ヘルパー ---------- */
+function drawCar(x, y, w, h, color, wobble) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.sin(wobble * 20) * Math.min(wobble, 0.15));
+
+  // タイヤ
+  ctx.fillStyle = "#333";
+  const tw = w * 0.22, th = h * 0.18;
+  [[-w/2 - tw*0.25, -h*0.28], [w/2 - tw*0.75, -h*0.28],
+   [-w/2 - tw*0.25,  h*0.12], [w/2 - tw*0.75,  h*0.12]].forEach(([tx, ty]) => {
+    roundRect(tx, ty, tw, th, tw * 0.4);
+    ctx.fill();
+  });
+
+  // ボディ
+  ctx.fillStyle = color.body;
+  roundRect(-w/2, -h/2, w, h, w * 0.28);
+  ctx.fill();
+  ctx.strokeStyle = color.dark;
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // フロントガラス
+  ctx.fillStyle = "#b3e5fc";
+  roundRect(-w*0.32, -h*0.36, w*0.64, h*0.22, 8);
+  ctx.fill();
+  // リアガラス
+  roundRect(-w*0.32, h*0.16, w*0.64, h*0.18, 8);
+  ctx.fill();
+
+  // ライト
+  ctx.fillStyle = "#fff59d";
+  ctx.beginPath();
+  ctx.arc(-w*0.3, -h*0.46, w*0.08, 0, Math.PI * 2);
+  ctx.arc(w*0.3, -h*0.46, w*0.08, 0, Math.PI * 2);
+  ctx.fill();
+
+  // にこにこ顔 (フロントガラスの中)
+  ctx.fillStyle = "#37474f";
+  ctx.beginPath();
+  ctx.arc(-w*0.12, -h*0.27, w*0.035, 0, Math.PI * 2);
+  ctx.arc(w*0.12, -h*0.27, w*0.035, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#37474f";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(0, -h*0.25, w*0.09, 0.2, Math.PI - 0.2);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground(dt) {
+  // 草原
+  ctx.fillStyle = "#a5d6a7";
+  ctx.fillRect(0, 0, W, H);
+
+  const { x: rx, w: rw } = roadRect();
+
+  // 道路の外の景色 (スクロール)
+  ctx.font = Math.min(48, W * 0.08) + "px serif";
+  const scroll = state === "play" ? speed * dt : 30 * dt;
+  [sceneryL, sceneryR].forEach((arr, side) => {
+    arr.forEach((s) => {
+      s.y += scroll;
+      if (s.y > H + 40) s.y = -60;
+      const sx = side === 0 ? rx / 2 : rx + rw + (W - rx - rw) / 2;
+      ctx.fillText(s.emoji, sx, s.y);
+    });
+  });
+
+  // 道路
+  ctx.fillStyle = "#78909c";
+  ctx.fillRect(rx, 0, rw, H);
+  // 縁石
+  ctx.fillStyle = "#eceff1";
+  ctx.fillRect(rx - 8, 0, 8, H);
+  ctx.fillRect(rx + rw, 0, 8, H);
+
+  // センターライン (スクロール)
+  roadOffset = (roadOffset + scroll) % 80;
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 8;
+  ctx.setLineDash([40, 40]);
+  ctx.lineDashOffset = -roadOffset;
+  ctx.beginPath();
+  ctx.moveTo(rx + rw / 2, -40);
+  ctx.lineTo(rx + rw / 2, H + 40);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // ふわふわ流れる くも
+  ctx.globalAlpha = 0.7;
+  ctx.font = "44px serif";
+  ctx.textAlign = "center";
+  clouds.forEach((c) => {
+    c.x += c.s * 12 * dt;
+    if (c.x > W + 60) c.x = -60;
+    ctx.fillText("☁️", c.x, c.y);
+  });
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- アイテム ---------- */
+function spawnItem() {
+  const { x: rx, w: rw } = roadRect();
+  const total = ITEM_TYPES.reduce((s, t) => s + t.weight, 0);
+  let r = Math.random() * total;
+  let type = ITEM_TYPES[0];
+  for (const t of ITEM_TYPES) {
+    r -= t.weight;
+    if (r <= 0) { type = t; break; }
+  }
+  const margin = rw * 0.14;
+  items.push({
+    x: rx + margin + Math.random() * (rw - margin * 2),
+    y: -60,
+    type,
+    size: Math.min(rw * 0.16, 58),
+  });
+}
+
+function burstParticles(x, y, colors, n) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 400,
+      vy: -Math.random() * 350 - 50,
+      life: 1,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      size: 5 + Math.random() * 7,
+    });
+  }
+}
+
+function celebrate() {
+  celebrateTimer = 2.2;
+  sfx.fanfare();
+  for (let i = 0; i < 5; i++) {
+    burstParticles(Math.random() * W, H * 0.3 + Math.random() * H * 0.3,
+      ["#ff5252", "#ffd600", "#448aff", "#66bb6a", "#ab47bc", "#ff9800"], 14);
+  }
+}
+
+/* ---------- 更新 ---------- */
+function update(dt) {
+  if (state !== "play") return;
+
+  const { x: rx, w: rw } = roadRect();
+  const cs = carSize();
+  const carY = H - cs.h * 0.9;
+
+  // キーボード操作
+  if (keys["ArrowLeft"] || keys["a"]) carTargetX -= 420 * dt;
+  if (keys["ArrowRight"] || keys["d"]) carTargetX += 420 * dt;
+
+  // 車をなめらかに移動
+  carTargetX = Math.max(rx + cs.w * 0.6, Math.min(rx + rw - cs.w * 0.6, carTargetX));
+  carX += (carTargetX - carX) * Math.min(1, 10 * dt);
+  if (carWobble > 0) carWobble = Math.max(0, carWobble - dt);
+
+  // アイテム生成
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnItem();
+    spawnTimer = 0.9 + Math.random() * 0.7;
+  }
+
+  // アイテム移動と当たり判定
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += speed * dt;
+    if (it.y > H + 80) { items.splice(i, 1); continue; }
+
+    const dx = Math.abs(it.x - carX);
+    const dy = Math.abs(it.y - carY);
+    if (dx < cs.w * 0.55 + it.size * 0.35 && dy < cs.h * 0.45 + it.size * 0.35) {
+      items.splice(i, 1);
+      if (it.type.kind === "star") {
+        stars++;
+        sfx.collect();
+        burstParticles(it.x, it.y, ["#ffd600", "#fff176", "#ffab00"], 10);
+      } else if (it.type.kind === "fruit") {
+        stars++;
+        sfx.fruit();
+        burstParticles(it.x, it.y, ["#ff8a80", "#ffcc80", "#b9f6ca"], 10);
+      } else {
+        // コーン: 失敗じゃなくて「ぼよん」と楽しく
+        sfx.bump();
+        carWobble = 0.5;
+        burstParticles(it.x, it.y, ["#ff9800", "#ffe0b2"], 8);
+      }
+      // 10こごとにお祝い
+      if (stars > 0 && stars % 10 === 0 && stars !== lastMilestone) {
+        lastMilestone = stars;
+        celebrate();
+        speed = Math.min(speed + 25, 420); // ちょっとずつ速く (上限あり)
+      }
+    }
+  }
+
+  // パーティクル
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 600 * dt;
+    p.life -= dt * 0.9;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  if (celebrateTimer > 0) celebrateTimer -= dt;
+}
+
+/* ---------- 描画 ---------- */
+function drawPlay() {
+  const cs = carSize();
+  const carY = H - cs.h * 0.9;
+
+  // アイテム
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  items.forEach((it) => {
+    ctx.font = it.size + "px serif";
+    ctx.fillText(it.type.emoji, it.x, it.y);
+  });
+
+  drawCar(carX, carY, cs.w, cs.h, carColor, carWobble);
+
+  // パーティクル
+  particles.forEach((p) => {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size / 2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // スコア (ほしのかず)
+  const scoreY = 26;
+  ctx.font = "bold " + Math.min(34, W * 0.06) + "px sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  const txt = "⭐ × " + stars;
+  const tw = ctx.measureText(txt).width;
+  roundRect(W / 2 - tw / 2 - 18, scoreY - 8, tw + 36, 48, 24);
+  ctx.fill();
+  ctx.fillStyle = "#f57f17";
+  ctx.textBaseline = "top";
+  ctx.fillText(txt, W / 2, scoreY);
+
+  // お祝いメッセージ
+  if (celebrateTimer > 0) {
+    const scale = 1 + Math.sin(celebrateTimer * 10) * 0.05;
+    ctx.save();
+    ctx.translate(W / 2, H * 0.35);
+    ctx.scale(scale, scale);
+    ctx.font = "bold " + Math.min(64, W * 0.12) + "px sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "#fff";
+    ctx.strokeText("🎉 すごい！ 🎉", 0, 0);
+    ctx.fillStyle = "#e91e63";
+    ctx.fillText("🎉 すごい！ 🎉", 0, 0);
+    ctx.restore();
+  }
+}
+
+function drawSelect() {
+  // タイトル
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const titleSize = Math.min(56, W * 0.09);
+  ctx.font = "bold " + titleSize + "px sans-serif";
+  ctx.lineWidth = 10;
+  ctx.strokeStyle = "#fff";
+  ctx.strokeText("🚗 ぶーぶー どらいぶ 🚙", W / 2, H * 0.18);
+  ctx.fillStyle = "#e65100";
+  ctx.fillText("🚗 ぶーぶー どらいぶ 🚙", W / 2, H * 0.18);
+
+  ctx.font = "bold " + Math.min(30, W * 0.05) + "px sans-serif";
+  ctx.lineWidth = 6;
+  ctx.strokeText("すきな くるまを えらんでね！", W / 2, H * 0.3);
+  ctx.fillStyle = "#33691e";
+  ctx.fillText("すきな くるまを えらんでね！", W / 2, H * 0.3);
+
+  // 車えらびボタン
+  const btns = selectButtons();
+  const bounce = Math.sin(performance.now() / 300) * 6;
+  btns.forEach((b, i) => {
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    roundRect(b.x, b.y + bounce * (i % 2 === 0 ? 1 : -1), b.w, b.h, 24);
+    ctx.fill();
+    ctx.strokeStyle = CAR_COLORS[i].body;
+    ctx.lineWidth = 5;
+    ctx.stroke();
+    const cw = b.w * 0.5;
+    drawCar(
+      b.x + b.w / 2,
+      b.y + b.h / 2 + bounce * (i % 2 === 0 ? 1 : -1),
+      cw, cw * 1.45, CAR_COLORS[i], 0
+    );
+  });
+
+  // あそびかた
+  ctx.font = Math.min(22, W * 0.04) + "px sans-serif";
+  ctx.fillStyle = "#37474f";
+  ctx.fillText("ゆびで うごかして ⭐や くだものを あつめよう！", W / 2, H * 0.85);
+}
+
+/* ---------- メインループ ---------- */
+function loop(time) {
+  const dt = Math.min((time - lastTime) / 1000, 0.05);
+  lastTime = time;
+
+  drawBackground(dt);
+  update(dt);
+
+  if (state === "select") drawSelect();
+  else drawPlay();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame((t) => { lastTime = t; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
